@@ -3,7 +3,7 @@ export const ROLE_CONFIG = {
     id: 'admin',
     label: 'Admin',
     description: 'Management and reports',
-    tabs: ['dashboard', 'orders', 'tables', 'inventory', 'staff', 'finance', 'reports', 'website'],
+    tabs: ['dashboard', 'orders', 'tables', 'reservations', 'inventory', 'staff', 'finance', 'reports', 'website'],
     defaultTab: 'dashboard',
   },
   cashier: {
@@ -24,7 +24,7 @@ export const ROLE_CONFIG = {
     id: 'waiter',
     label: 'Waiter',
     description: 'Tables and serving',
-    tabs: ['tables', 'waiter', 'orders'],
+    tabs: ['tables', 'reservations', 'waiter', 'orders'],
     defaultTab: 'tables',
   },
 };

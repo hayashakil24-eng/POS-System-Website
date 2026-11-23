@@ -130,6 +130,7 @@ const INITIAL_ORDERS = [
     serveStatus: 'waiting',
     elapsedMins: 14,
     synced: true,
+    paymentMethod: 'Cash',
   },
   {
     id: 'ORD-105',
@@ -147,6 +148,7 @@ const INITIAL_ORDERS = [
     serveStatus: 'waiting',
     elapsedMins: 11,
     synced: true,
+    paymentMethod: 'Card',
   },
   {
     id: 'ORD-106',
@@ -161,8 +163,89 @@ const INITIAL_ORDERS = [
     serveStatus: 'waiting',
     elapsedMins: 3,
     synced: true,
+    paymentMethod: 'Cash',
   },
 ];
+
+const RESERVATION_STATUSES = ['pending', 'confirmed', 'arrived', 'seated', 'completed', 'cancelled', 'no_show'];
+const RESERVATION_DURATION_MIN = 90;
+
+function toIsoDate(d = new Date()) {
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, '0');
+  const day = String(d.getDate()).padStart(2, '0');
+  return `${y}-${m}-${day}`;
+}
+
+function addDaysIso(baseIso, days) {
+  const d = new Date(`${baseIso}T00:00:00`);
+  d.setDate(d.getDate() + days);
+  return toIsoDate(d);
+}
+
+function normalizeTime24(t) {
+  if (!t) return '19:00';
+  const s = String(t).trim();
+  const ampm = s.match(/^(\d{1,2}):(\d{2})\s*(AM|PM)$/i);
+  if (ampm) {
+    let h = Number(ampm[1]) % 12;
+    if (ampm[3].toUpperCase() === 'PM') h += 12;
+    return `${String(h).padStart(2, '0')}:${ampm[2]}`;
+  }
+  const hm = s.match(/^(\d{1,2}):(\d{2})$/);
+  if (hm) return `${String(Number(hm[1])).padStart(2, '0')}:${hm[2]}`;
+  return '19:00';
+}
+
+function timeToMinutes(t) {
+  const [h, m] = normalizeTime24(t).split(':').map(Number);
+  return h * 60 + m;
+}
+
+function formatTime12(t) {
+  const [h, m] = normalizeTime24(t).split(':').map(Number);
+  const suffix = h >= 12 ? 'PM' : 'AM';
+  const hr = h % 12 || 12;
+  return `${hr}:${String(m).padStart(2, '0')} ${suffix}`;
+}
+
+function reservationWindowMinutes(time) {
+  const start = timeToMinutes(time);
+  return [start, start + RESERVATION_DURATION_MIN];
+}
+
+function reservationsConflict(a, b) {
+  if (!a || !b) return false;
+  if ((a.date || '') !== (b.date || '')) return false;
+  if ((a.tableId || '') !== (b.tableId || '')) return false;
+  if (!a.tableId) return false;
+  if (['cancelled', 'no_show', 'completed'].includes(a.status) || ['cancelled', 'no_show', 'completed'].includes(b.status)) return false;
+  const [as, ae] = reservationWindowMinutes(a.time);
+  const [bs, be] = reservationWindowMinutes(b.time);
+  return as < be && bs < ae;
+}
+
+function buildInitialDemoOrders() {
+  const today = new Date();
+  const offsets = [0, -1, -3, -8, -14, -21];
+  const times = ['12:30', '13:15', '19:10', '20:05', '18:40', '21:00'];
+  const sources = ['Dine-In', 'Takeaway', 'Delivery', 'Dine-In', 'Delivery', 'Takeaway'];
+  const payments = ['Cash', 'Card', 'Online', 'Card', 'Cash', 'Online'];
+  const base = INITIAL_ORDERS.map((o) => ({ ...o }));
+  return base.map((o, i) => {
+    const d = new Date(today);
+    d.setDate(d.getDate() + offsets[i % offsets.length]);
+    const [hh, mm] = times[i % times.length].split(':').map(Number);
+    d.setHours(hh, mm, 0, 0);
+    const src = o.source === 'Web' || o.table === 'Web Delivery' ? 'Delivery' : (o.source || sources[i % sources.length]);
+    return {
+      ...o,
+      source: src,
+      paymentMethod: o.paymentMethod || payments[i % payments.length],
+      createdAt: d.toISOString(),
+    };
+  });
+}
 
 const INITIAL_INVENTORY = [
   { id: 'INV-1', item: 'Brioche Buns', unit: 'pcs', onHand: 42, minStock: 20 },
@@ -189,6 +272,7 @@ const NAV = [
   { id: 'pos', label: 'POS Billing', icon: ShoppingBag },
   { id: 'orders', label: 'Orders', icon: ClipboardList },
   { id: 'tables', label: 'Tables', icon: Grid },
+  { id: 'reservations', label: 'Reservations', icon: Calendar },
   { id: 'kitchen', label: 'Kitchen (KDS)', icon: ChefHat },
   { id: 'waiter', label: 'Waiter Tablet', icon: Smartphone },
   { id: 'inventory', label: 'Inventory & Recipes', icon: Package },
@@ -198,13 +282,45 @@ const NAV = [
   { id: 'website', label: 'Customer Website', icon: Globe },
 ];
 
+function normalizeOrder(o, i = 0) {
+  if (!o) return o;
+  const createdAt = o.createdAt || new Date(Date.now() - i * 3600000).toISOString();
+  let source = o.source || 'Dine-In';
+  if (source === 'Website') source = o.table === 'Web Delivery' || o.deliveryAddress ? 'Delivery' : 'Takeaway';
+  const paymentMethod = o.paymentMethod || (o.paid ? 'Cash' : 'Cash');
+  return { ...o, source, createdAt, paymentMethod, refunded: Boolean(o.refunded), synced: o.synced !== false };
+}
+
+function normalizeReservation(r, i = 0) {
+  if (!r) return r;
+  const date = r.date || toIsoDate();
+  const time = normalizeTime24(r.time || '19:00');
+  const status = RESERVATION_STATUSES.includes(r.status) ? r.status : 'pending';
+  return {
+    id: r.id || `RSV-${201 + i}`,
+    name: r.name || 'Guest',
+    phone: r.phone || '',
+    date,
+    time,
+    guests: Number(r.guests || 2),
+    status,
+    tableId: r.tableId || '',
+    tableName: r.tableName || '',
+    occasion: r.occasion || '',
+    specialRequests: r.specialRequests || r.notes || '',
+    notes: r.notes || '',
+    source: r.source || 'Staff',
+    createdAt: r.createdAt || new Date().toISOString(),
+  };
+}
+
 const DEFAULT_PERSISTED_STATE = {
   role: 'admin',
   activeTab: 'dashboard',
   isOnline: true,
   menu: INITIAL_MENU,
   tables: INITIAL_TABLES,
-  orders: INITIAL_ORDERS,
+  orders: buildInitialDemoOrders(),
   inventory: INITIAL_INVENTORY,
   staff: INITIAL_STAFF,
   reservations: [],
@@ -339,10 +455,14 @@ function delay(ms = 500) {
 
   const [menu, setMenu] = useState(Array.isArray(persisted.menu) ? persisted.menu : INITIAL_MENU);
   const [tables, setTables] = useState(Array.isArray(persisted.tables) ? persisted.tables : INITIAL_TABLES);
-  const [orders, setOrders] = useState(Array.isArray(persisted.orders) ? persisted.orders : INITIAL_ORDERS);
+  const [orders, setOrders] = useState(
+    (Array.isArray(persisted.orders) && persisted.orders.length ? persisted.orders : buildInitialDemoOrders()).map(normalizeOrder)
+  );
   const [inventory, setInventory] = useState(Array.isArray(persisted.inventory) ? persisted.inventory : INITIAL_INVENTORY);
   const [staff, setStaff] = useState(Array.isArray(persisted.staff) ? persisted.staff : INITIAL_STAFF);
-  const [reservations, setReservations] = useState(Array.isArray(persisted.reservations) ? persisted.reservations : []);
+  const [reservations, setReservations] = useState(
+    (Array.isArray(persisted.reservations) ? persisted.reservations : []).map(normalizeReservation)
+  );
 
   const [openingCash, setOpeningCash] = useState(Number(persisted.openingCash ?? 15000));
   const [expenses, setExpenses] = useState(Number(persisted.expenses ?? 2500));
@@ -386,11 +506,25 @@ function delay(ms = 500) {
   const [custAddress, setCustAddress] = useState('');
   const [webError, setWebError] = useState('');
   const [webReceipt, setWebReceipt] = useState(null);
-  const [resName, setResName] = useState('');
-  const [resPhone, setResPhone] = useState('');
-  const [resGuests, setResGuests] = useState(4);
-  const [resTime, setResTime] = useState('8:00 PM');
-  const [resMsg, setResMsg] = useState('');
+  const [webResForm, setWebResForm] = useState({ name: '', phone: '', date: toIsoDate(), time: '19:00', guests: 2 });
+  const [webResMsg, setWebResMsg] = useState('');
+
+  // Reports state
+  const [reportRange, setReportRange] = useState('7d');
+  const [reportCustomFrom, setReportCustomFrom] = useState(addDaysIso(toIsoDate(), -6));
+  const [reportCustomTo, setReportCustomTo] = useState(toIsoDate());
+
+  // Staff reservations state
+  const [resViewMode, setResViewMode] = useState('list');
+  const [resDate, setResDate] = useState(toIsoDate());
+  const [resSearch, setResSearch] = useState('');
+  const [resStatusFilter, setResStatusFilter] = useState('all');
+  const [resDrawerOpen, setResDrawerOpen] = useState(false);
+  const [resEditingId, setResEditingId] = useState(null);
+  const [resForm, setResForm] = useState({ name: '', phone: '', date: toIsoDate(), time: '19:00', guests: 2, occasion: '', tableId: '', specialRequests: '', notes: '', status: 'pending' });
+  const [resFormErrors, setResFormErrors] = useState({});
+  const [resFormMsg, setResFormMsg] = useState(null);
+  const [resConfirm, setResConfirm] = useState(null);
 
   useEffect(() => {
     const t = setTimeout(() => setIsHydrating(false), 450);
@@ -542,6 +676,8 @@ function delay(ms = 500) {
       serveStatus: 'waiting',
       elapsedMins: 0,
       synced: isOnline,
+      paymentMethod: paidNow ? 'Cash' : 'Pending',
+      createdAt: new Date().toISOString(),
     };
     setOrders((prev) => [created, ...prev]);
     if (orderType === 'Dine-In') {
@@ -634,9 +770,11 @@ function delay(ms = 500) {
     setActionLoading('webCheckout', true);
     await delay(650);
     const id = `WEB-${301 + orders.length}`;
+    const source = webFulfillment === 'Delivery' ? 'Delivery' : 'Takeaway';
+    const paymentMethod = webPayment === 'Card / Online' ? 'Online' : 'Cash';
     const newOrder = {
       id,
-      source: 'Website',
+      source,
       table: webFulfillment === 'Delivery' ? 'Web Delivery' : 'Web Pickup',
       waiter: 'Online',
       customerName: custName.trim(),
@@ -650,6 +788,8 @@ function delay(ms = 500) {
       serveStatus: 'waiting',
       elapsedMins: 0,
       synced: isOnline,
+      paymentMethod,
+      createdAt: new Date().toISOString(),
     };
     setOrders((prev) => [newOrder, ...prev]);
     setMenu((prev) =>
@@ -668,21 +808,128 @@ function delay(ms = 500) {
     showToast(`Website order ${id} placed and sent to POS & Kitchen.`);
   };
 
-  const submitReservation = async (e) => {
-    e.preventDefault();
+  const placeReservation = async () => {
     if (actionState.reservation) return;
-    if (!resName.trim() || !resPhone.trim()) return;
+    const name = (webResForm.name || '').trim();
+    const phone = (webResForm.phone || '').trim();
+    if (!name || !phone || !webResForm.date || !webResForm.time) {
+      setWebResMsg({ tone: 'danger', text: 'Please enter your name, phone, date, and time.' });
+      return;
+    }
     setActionLoading('reservation', true);
     await delay(450);
-    setReservations((prev) => [
-      { id: `RSV-${201 + prev.length}`, name: resName.trim(), phone: resPhone.trim(), guests: Number(resGuests), time: resTime },
-      ...prev,
-    ]);
-    setResMsg(`Table request confirmed for ${resName.trim()} (${resGuests} guests at ${resTime}).`);
-    setResName('');
-    setResPhone('');
+    const created = normalizeReservation({
+      id: `RSV-${Date.now().toString().slice(-6)}`,
+      name,
+      phone,
+      date: webResForm.date,
+      time: webResForm.time,
+      guests: Number(webResForm.guests || 2),
+      status: 'pending',
+      source: 'Website',
+      createdAt: new Date().toISOString(),
+    });
+    setReservations((prev) => [created, ...prev]);
+    setWebResMsg({ tone: 'success', text: `Request received for ${created.name} on ${created.date} at ${formatTime12(created.time)}.` });
+    setWebResForm({ name: '', phone: '', date: toIsoDate(), time: '19:00', guests: 2 });
     setActionLoading('reservation', false);
-    showToast('Reservation saved successfully.');
+    showToast('Reservation request saved.');
+  };
+
+  const openNewReservation = (date = resDate) => {
+    setResEditingId(null);
+    setResForm({ name: '', phone: '', date: date || toIsoDate(), time: '19:00', guests: 2, occasion: '', tableId: '', specialRequests: '', notes: '', status: 'pending' });
+    setResFormErrors({});
+    setResFormMsg(null);
+    setResDrawerOpen(true);
+  };
+
+  const openEditReservation = (r) => {
+    setResEditingId(r.id);
+    setResForm({
+      name: r.name || '',
+      phone: r.phone || '',
+      date: r.date || toIsoDate(),
+      time: normalizeTime24(r.time || '19:00'),
+      guests: r.guests || 2,
+      occasion: r.occasion || '',
+      tableId: r.tableId || '',
+      specialRequests: r.specialRequests || '',
+      notes: r.notes || '',
+      status: r.status || 'pending',
+    });
+    setResFormErrors({});
+    setResFormMsg(null);
+    setResDrawerOpen(true);
+  };
+
+  const getReservationConflicts = (candidate, ignoreId = null) => {
+    return reservations.filter((r) => r.id !== ignoreId && reservationsConflict(candidate, r));
+  };
+
+  const getAvailableTablesForSlot = (date, time, guests, ignoreId = null) => {
+    return tables.map((t) => {
+      const capacityOk = Number(t.seats || 0) >= Number(guests || 1);
+      const candidate = { date, time, tableId: t.id, status: 'confirmed' };
+      const conflicts = getReservationConflicts(candidate, ignoreId);
+      return { table: t, capacityOk, available: capacityOk && conflicts.length === 0, conflicts };
+    });
+  };
+
+  const saveStaffReservation = async () => {
+    if (actionState.reservationSave) return;
+    const errors = {};
+    if (!resForm.name.trim()) errors.name = 'Customer name is required.';
+    if (!resForm.phone.trim()) errors.phone = 'Phone number is required.';
+    if (!resForm.date) errors.date = 'Date is required.';
+    if (!resForm.time) errors.time = 'Time is required.';
+    if (!Number(resForm.guests) || Number(resForm.guests) < 1) errors.guests = 'Guest count must be at least 1.';
+    const table = tables.find((t) => t.id === resForm.tableId);
+    const candidate = { ...resForm, tableId: resForm.tableId || '', status: resForm.status || 'pending' };
+    if (table && Number(table.seats) < Number(resForm.guests)) errors.tableId = 'Selected table does not have enough capacity.';
+    if (resForm.tableId) {
+      const conflicts = getReservationConflicts(candidate, resEditingId);
+      if (conflicts.length) errors.tableId = 'This table is already booked for the selected time.';
+    }
+    setResFormErrors(errors);
+    if (Object.keys(errors).length) {
+      setResFormMsg({ tone: 'danger', text: 'Please fix the highlighted fields before saving.' });
+      return;
+    }
+    setActionLoading('reservationSave', true);
+    await delay(450);
+    const payload = normalizeReservation({
+      ...(resEditingId ? reservations.find((r) => r.id === resEditingId) || {} : {}),
+      ...resForm,
+      id: resEditingId || `RSV-${Date.now().toString().slice(-6)}`,
+      guests: Number(resForm.guests),
+      tableName: table ? table.name : '',
+      source: resEditingId ? (reservations.find((r) => r.id === resEditingId)?.source || 'Staff') : 'Staff',
+      createdAt: resEditingId ? (reservations.find((r) => r.id === resEditingId)?.createdAt || new Date().toISOString()) : new Date().toISOString(),
+    });
+    setReservations((prev) => resEditingId ? prev.map((r) => (r.id === resEditingId ? payload : r)) : [payload, ...prev]);
+    setActionLoading('reservationSave', false);
+    setResDrawerOpen(false);
+    setResEditingId(null);
+    setResFormMsg(null);
+    showToast(resEditingId ? 'Reservation updated successfully.' : 'Reservation created successfully.');
+  };
+
+  const updateReservationStatus = async (id, status, opts = {}) => {
+    if (actionState[`res-${id}`]) return;
+    setActionLoading(`res-${id}`, true);
+    await delay(350);
+    setReservations((prev) => prev.map((r) => (r.id === id ? normalizeReservation({ ...r, status, ...opts }) : r)));
+    setResForm((f) => (resEditingId === id ? { ...f, status, ...(opts.tableId !== undefined ? { tableId: opts.tableId } : {}) } : f));
+    setActionLoading(`res-${id}`, false);
+    if (id === resConfirm?.id) setResConfirm(null);
+    const labels = { confirmed: 'confirmed', arrived: 'marked as arrived', seated: 'marked as seated', completed: 'completed', cancelled: 'cancelled', no_show: 'marked as no-show', pending: 'moved to pending' };
+    showToast(`Reservation ${labels[status] || 'updated'}.`);
+  };
+
+  const quickAssignReservationTable = async (id, tableId) => {
+    const table = tables.find((t) => t.id === tableId);
+    await updateReservationStatus(id, (reservations.find((r) => r.id === id)?.status || 'pending'), { tableId, tableName: table ? table.name : '' });
   };
 
   const markOrderPaid = async (orderId) => {
@@ -717,21 +964,36 @@ function delay(ms = 500) {
     if (actionState.exportCsv) return;
     setActionLoading('exportCsv', true);
     await delay(350);
-    const csv = [
-      ['ID', 'Source', 'Table', 'Kitchen', 'Paid', 'Refunded', 'Synced', 'Total'],
-      ...orders.map((o) => [o.id, o.source, o.table, o.kitchenStatus, o.paid, o.refunded || false, o.synced, o.total]),
-    ]
-      .map((r) => r.join(','))
-      .join('\n');
-    const blob = new Blob([csv], { type: 'text/csv' });
+    const rows = [
+      ['Date', 'Time', 'Order ID', 'Source', 'Table', 'Payment Method', 'Paid', 'Refunded', 'Kitchen', 'Served', 'Synced', 'Total'],
+      ...reportOrders.map((o) => {
+        const d = orderDate(o);
+        return [
+          toIsoDate(d),
+          d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+          o.id,
+          o.source,
+          o.table,
+          o.paymentMethod || '',
+          o.paid ? 'Yes' : 'No',
+          o.refunded ? 'Yes' : 'No',
+          o.kitchenStatus,
+          o.serveStatus,
+          o.synced ? 'Yes' : 'No',
+          o.total,
+        ];
+      }),
+    ];
+    const csv = rows.map((r) => r.map((v) => `"${String(v ?? '').replace(/"/g, '""')}"`).join(',')).join('\n');
+    const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;
-    a.download = 'orders-report.csv';
+    a.download = `orders-report-${reportBounds.from}-to-${reportBounds.to}.csv`;
     a.click();
     URL.revokeObjectURL(url);
     setActionLoading('exportCsv', false);
-    showToast('CSV report exported.');
+    showToast(`CSV exported for ${reportBounds.from} to ${reportBounds.to}.`);
   };
 
   const filteredPosMenu = menu.filter((m) => {
@@ -754,6 +1016,152 @@ function delay(ms = 500) {
   const inspectedOrder = orders.find((o) => o.id === inspectOrderId) || null;
   const expectedCash = Number(openingCash) + collectedSales - Number(expenses);
   const cashDiff = countedCash === '' ? null : Number(countedCash) - expectedCash;
+
+  const reportBounds = useMemo(() => {
+    const today = toIsoDate();
+    let from = today;
+    let to = today;
+    if (reportRange === '7d') from = addDaysIso(today, -6);
+    if (reportRange === '30d') from = addDaysIso(today, -29);
+    if (reportRange === 'custom') {
+      from = reportCustomFrom || today;
+      to = reportCustomTo || from;
+      if (from > to) [from, to] = [to, from];
+    }
+    const fromDate = new Date(`${from}T00:00:00`);
+    const toDate = new Date(`${to}T23:59:59.999`);
+    const days = Math.max(1, Math.round((toDate - fromDate) / 86400000) + 1);
+    const prevEnd = new Date(fromDate);
+    prevEnd.setDate(prevEnd.getDate() - 1);
+    prevEnd.setHours(23, 59, 59, 999);
+    const prevStart = new Date(prevEnd);
+    prevStart.setDate(prevStart.getDate() - (days - 1));
+    prevStart.setHours(0, 0, 0, 0);
+    return { from, to, fromDate, toDate, prevStart, prevEnd, days };
+  }, [reportRange, reportCustomFrom, reportCustomTo]);
+
+  const orderDate = (o) => new Date(o.createdAt || Date.now());
+  const inRange = (o, start, end) => {
+    const d = orderDate(o);
+    return d >= start && d <= end;
+  };
+
+  const reportOrders = useMemo(
+    () => orders.filter((o) => inRange(o, reportBounds.fromDate, reportBounds.toDate)).map(normalizeOrder),
+    [orders, reportBounds]
+  );
+  const prevReportOrders = useMemo(
+    () => orders.filter((o) => inRange(o, reportBounds.prevStart, reportBounds.prevEnd)).map(normalizeOrder),
+    [orders, reportBounds]
+  );
+
+  const calcOrderRevenue = (o) => (o.refunded ? 0 : Number(o.total || 0));
+  const calcCollected = (o) => (o.paid && !o.refunded ? Number(o.total || 0) : 0);
+
+  const reportMetrics = useMemo(() => {
+    const sum = (arr, fn) => arr.reduce((s, x) => s + fn(x), 0);
+    const revenue = sum(reportOrders, calcOrderRevenue);
+    const count = reportOrders.length;
+    const avg = count ? Math.round(revenue / count) : 0;
+    const collected = sum(reportOrders, calcCollected);
+    const unpaid = sum(reportOrders, (o) => (!o.paid && !o.refunded ? Number(o.total || 0) : 0));
+    const prevRevenue = sum(prevReportOrders, calcOrderRevenue);
+    const prevCount = prevReportOrders.length;
+    const prevAvg = prevCount ? Math.round(prevRevenue / prevCount) : 0;
+    const prevCollected = sum(prevReportOrders, calcCollected);
+    const prevUnpaid = sum(prevReportOrders, (o) => (!o.paid && !o.refunded ? Number(o.total || 0) : 0));
+    const pct = (cur, prev) => (prev === 0 ? (cur === 0 ? 0 : 100) : Math.round(((cur - prev) / prev) * 100));
+    return {
+      revenue, count, avg, collected, unpaid,
+      prev: { revenue: prevRevenue, count: prevCount, avg: prevAvg, collected: prevCollected, unpaid: prevUnpaid },
+      cmp: { revenue: pct(revenue, prevRevenue), count: pct(count, prevCount), avg: pct(avg, prevAvg), collected: pct(collected, prevCollected), unpaid: pct(unpaid, prevUnpaid) },
+    };
+  }, [reportOrders, prevReportOrders]);
+
+  const salesByDay = useMemo(() => {
+    const map = new Map();
+    for (let i = 0; i < reportBounds.days; i++) {
+      const d = new Date(reportBounds.fromDate);
+      d.setDate(d.getDate() + i);
+      const key = toIsoDate(d);
+      map.set(key, { date: key, label: d.toLocaleDateString(undefined, { month: 'short', day: 'numeric' }), revenue: 0, orders: 0 });
+    }
+    reportOrders.forEach((o) => {
+      const key = toIsoDate(orderDate(o));
+      if (!map.has(key)) map.set(key, { date: key, label: key.slice(5), revenue: 0, orders: 0 });
+      const row = map.get(key);
+      row.revenue += calcOrderRevenue(o);
+      row.orders += 1;
+    });
+    return Array.from(map.values()).sort((a, b) => a.date.localeCompare(b.date));
+  }, [reportOrders, reportBounds]);
+
+  const categoryBreakdown = useMemo(() => {
+    const byName = new Map(menu.map((m) => [m.name, m.category || 'Other']));
+    const map = new Map();
+    reportOrders.forEach((o) => {
+      if (o.refunded) return;
+      (o.items || []).forEach((it) => {
+        const cat = byName.get(it.name) || 'Other';
+        map.set(cat, (map.get(cat) || 0) + Number(it.price || 0) * Number(it.qty || 0));
+      });
+    });
+    return Array.from(map.entries()).map(([name, value]) => ({ name, value })).sort((a, b) => b.value - a.value);
+  }, [reportOrders, menu]);
+
+  const sourceBreakdown = useMemo(() => {
+    const map = new Map([['Dine-In', 0], ['Takeaway', 0], ['Delivery', 0]]);
+    reportOrders.forEach((o) => {
+      if (o.refunded) return;
+      const s = o.source === 'Delivery' ? 'Delivery' : o.source === 'Takeaway' ? 'Takeaway' : 'Dine-In';
+      map.set(s, (map.get(s) || 0) + Number(o.total || 0));
+    });
+    return Array.from(map.entries()).map(([name, value]) => ({ name, value }));
+  }, [reportOrders]);
+
+  const topProducts = useMemo(() => {
+    const map = new Map();
+    reportOrders.forEach((o) => {
+      if (o.refunded) return;
+      (o.items || []).forEach((it) => {
+        const prev = map.get(it.name) || { name: it.name, qty: 0, revenue: 0 };
+        prev.qty += Number(it.qty || 0);
+        prev.revenue += Number(it.price || 0) * Number(it.qty || 0);
+        map.set(it.name, prev);
+      });
+    });
+    return Array.from(map.values()).sort((a, b) => b.revenue - a.revenue).slice(0, 6);
+  }, [reportOrders]);
+
+  const peakHours = useMemo(() => {
+    const buckets = Array.from({ length: 12 }, (_, i) => {
+      const h = 10 + i; // 10:00 - 21:00
+      const label = `${h % 12 || 12}${h >= 12 ? 'p' : 'a'}`;
+      return { hour: h, label, orders: 0, revenue: 0 };
+    });
+    reportOrders.forEach((o) => {
+      if (o.refunded) return;
+      const h = orderDate(o).getHours();
+      const b = buckets.find((x) => x.hour === h);
+      if (b) { b.orders += 1; b.revenue += Number(o.total || 0); }
+    });
+    return buckets;
+  }, [reportOrders]);
+
+  const paymentBreakdown = useMemo(() => {
+    const map = new Map();
+    reportOrders.forEach((o) => {
+      if (o.refunded) return;
+      const m = o.paymentMethod || (o.paid ? 'Cash' : 'Pending');
+      map.set(m, (map.get(m) || 0) + Number(o.total || 0));
+    });
+    return Array.from(map.entries()).map(([name, value]) => ({ name, value })).sort((a, b) => b.value - a.value);
+  }, [reportOrders]);
+
+  const reportRecentOrders = useMemo(
+    () => [...reportOrders].sort((a, b) => orderDate(b) - orderDate(a)).slice(0, 12),
+    [reportOrders]
+  );
 
   const filteredWebMenu = menu.filter((m) => {
     const catOk = webCategory === 'All' || m.category === webCategory;
@@ -811,7 +1219,7 @@ function delay(ms = 500) {
           <div className="truncate">
             <span className="font-semibold text-sm sm:text-base">RestroFlow</span>
             <span className="hidden md:inline text-xs text-slate-400 ml-2">
-              {roleConfig.label} Ã¢â‚¬Â¢ {roleConfig.description}
+              {roleConfig.label} • {roleConfig.description}
             </span>
           </div>
         </div>
@@ -942,7 +1350,7 @@ function delay(ms = 500) {
                     <div className="bg-white p-4 rounded-xl border border-slate-200">
                       <p className="text-xs font-medium text-slate-500">Sync Queue / Low Stock</p>
                       <p className="text-2xl font-bold mt-1">{pendingSync} pending</p>
-                      <p className="text-xs text-rose-700 mt-2">Low stock: {lowStockCount} Ã¢â‚¬Â¢ Unpaid: PKR {unpaidTotal.toLocaleString()}</p>
+                      <p className="text-xs text-rose-700 mt-2">Low stock: {lowStockCount} • Unpaid: PKR {unpaidTotal.toLocaleString()}</p>
                     </div>
                   </div>
 
@@ -1004,7 +1412,7 @@ function delay(ms = 500) {
                                 <span className="font-semibold text-sm text-slate-900">{item.name}</span>
                                 <span className="text-xs text-slate-400">{item.category}</span>
                               </div>
-                              <p className="text-xs text-slate-500 mt-1">Stock: {item.stock} Ã¢â‚¬Â¢ ~{item.prepMins}m</p>
+                              <p className="text-xs text-slate-500 mt-1">Stock: {item.stock} • ~{item.prepMins}m</p>
                             </div>
                             <div className="mt-3 pt-2 border-t border-slate-100 flex items-center justify-between">
                               <span className="font-bold text-sm">PKR {item.price.toLocaleString()}</span>
@@ -1033,7 +1441,7 @@ function delay(ms = 500) {
                         <label className="block text-xs font-medium text-slate-600 mb-1">Table</label>
                         <select value={selectedTable} onChange={(e) => setSelectedTable(e.target.value)} className="w-full px-3 py-2 text-sm border border-slate-300 rounded-lg bg-white">
                           {tables.map((t) => (
-                            <option key={t.id} value={t.name}>{t.name} ({t.seats} seats ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ {t.status})</option>
+                            <option key={t.id} value={t.name}>{t.name} ({t.seats} seats • {t.status})</option>
                           ))}
                         </select>
                       </div>
@@ -1150,8 +1558,8 @@ function delay(ms = 500) {
                         <div className="space-y-4">
                           <div className="flex items-center justify-between border-b border-slate-200 pb-3">
                             <div>
-                              <h3 className="font-bold text-base">{inspectedOrder.id} Ã¢â‚¬Â¢ {inspectedOrder.table}</h3>
-                              <p className="text-xs text-slate-500">{inspectedOrder.source} Ã¢â‚¬Â¢ Kitchen: {inspectedOrder.kitchenStatus} Ã¢â‚¬Â¢ {inspectedOrder.synced ? 'Synced' : 'Pending sync'}</p>
+                              <h3 className="font-bold text-base">{inspectedOrder.id} • {inspectedOrder.table}</h3>
+                              <p className="text-xs text-slate-500">{inspectedOrder.source} • Kitchen: {inspectedOrder.kitchenStatus} • {inspectedOrder.synced ? 'Synced' : 'Pending sync'}</p>
                             </div>
                             <button type="button" onClick={() => setInspectOrderId(null)} className="p-1.5 rounded-lg hover:bg-slate-100"><X className="w-4 h-4" /></button>
                           </div>
@@ -1212,14 +1620,14 @@ function delay(ms = 500) {
                             <div className="flex items-start justify-between">
                               <div>
                                 <h2 className="font-bold text-base">{t.name}</h2>
-                                <p className="text-xs text-slate-500 mt-0.5">{t.seats} Seats ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ Waiter: {t.waiter}</p>
+                                <p className="text-xs text-slate-500 mt-0.5">{t.seats} Seats • Waiter: {t.waiter}</p>
                                 {t.reservedFor && <p className="text-xs text-amber-700 mt-1">Reserved: {t.reservedFor}</p>}
                               </div>
                               <Badge tone={tone}>{label}</Badge>
                             </div>
                             <div className="flex items-center justify-between text-sm pt-2 border-t border-slate-100">
                               <span className="text-slate-500">{t.status === 'available' ? 'Open table' : `Duration: ${t.elapsedMins || 0}m`}</span>
-                              <span className="font-bold">{t.total > 0 ? `PKR ${t.total.toLocaleString()}` : 'Ã¢â‚¬â€'}</span>
+                              <span className="font-bold">{t.total > 0 ? `PKR ${t.total.toLocaleString()}` : '—'}</span>
                             </div>
                             <div className="flex gap-2">
                               {roleConfig.tabs.includes('pos') && (
@@ -1236,6 +1644,308 @@ function delay(ms = 500) {
                   )}
                 </div>
               )}
+
+              {activeTab === 'reservations' && (() => {
+                const dayReservations = reservations
+                  .filter((r) => (r.date || '') === resDate)
+                  .filter((r) => resStatusFilter === 'all' ? true : r.status === resStatusFilter)
+                  .filter((r) => {
+                    const q = resSearch.trim().toLowerCase();
+                    if (!q) return true;
+                    return [r.name, r.phone, r.tableName, r.id, r.status, r.occasion, r.specialRequests].some((v) => String(v || '').toLowerCase().includes(q));
+                  })
+                  .sort((a, b) => timeToMinutes(a.time) - timeToMinutes(b.time));
+                const allDay = reservations.filter((r) => (r.date || '') === resDate);
+                const summary = {
+                  total: allDay.length,
+                  pending: allDay.filter((r) => r.status === 'pending').length,
+                  confirmed: allDay.filter((r) => r.status === 'confirmed').length,
+                  arrived: allDay.filter((r) => r.status === 'arrived').length,
+                  seated: allDay.filter((r) => r.status === 'seated').length,
+                };
+                const statusTone = (s) => (s === 'confirmed' ? 'info' : s === 'arrived' ? 'warning' : s === 'seated' ? 'success' : s === 'completed' ? 'success' : s === 'cancelled' || s === 'no_show' ? 'danger' : 'warning');
+                const timeSlots = Array.from({ length: 24 }, (_, i) => `${String(10 + Math.floor(i / 2)).padStart(2, '0')}:${i % 2 === 0 ? '00' : '30'}`).filter((t) => timeToMinutes(t) >= 10 * 60 && timeToMinutes(t) <= 22 * 60);
+                const formTableOptions = getAvailableTablesForSlot(resForm.date || resDate, resForm.time || '19:00', resForm.guests || 2, resEditingId);
+                const selectedTableInfo = formTableOptions.find((x) => x.table.id === resForm.tableId);
+                return (
+                  <div className="space-y-4">
+                    <div className="flex flex-col lg:flex-row lg:items-end lg:justify-between gap-3">
+                      <div>
+                        <h1 className="text-xl font-semibold">Reservations</h1>
+                        <p className="text-sm text-slate-500">Manage bookings, arrivals, seating, and table assignments for service.</p>
+                      </div>
+                      <div className="flex flex-wrap items-center gap-2">
+                        <div className="inline-flex items-center rounded-lg border border-slate-300 bg-white overflow-hidden">
+                          <button type="button" onClick={() => setResViewMode('list')} className={`px-3 py-1.5 text-xs font-semibold ${resViewMode === 'list' ? 'bg-slate-900 text-white' : 'text-slate-700 hover:bg-slate-50'}`}>List</button>
+                          <button type="button" onClick={() => setResViewMode('calendar')} className={`px-3 py-1.5 text-xs font-semibold border-l border-slate-300 ${resViewMode === 'calendar' ? 'bg-slate-900 text-white' : 'text-slate-700 hover:bg-slate-50'}`}>Calendar</button>
+                        </div>
+                        <button type="button" onClick={() => openNewReservation(resDate)} className="px-3.5 py-2 rounded-lg bg-slate-900 text-white text-sm font-semibold inline-flex items-center gap-2"><Plus className="w-4 h-4" /> New Reservation</button>
+                      </div>
+                    </div>
+
+                    <div className="grid grid-cols-2 sm:grid-cols-3 xl:grid-cols-5 gap-3">
+                      {[
+                        ['Total', summary.total, 'All bookings today'],
+                        ['Pending', summary.pending, 'Awaiting confirmation'],
+                        ['Confirmed', summary.confirmed, 'Ready to arrive'],
+                        ['Arrived', summary.arrived, 'Checked in'],
+                        ['Seated', summary.seated, 'Currently at table'],
+                      ].map(([label, value, sub]) => (
+                        <div key={label} className="bg-white p-4 rounded-xl border border-slate-200">
+                          <p className="text-xs text-slate-500">{label}</p>
+                          <p className="text-2xl font-bold mt-1">{value}</p>
+                          <p className="text-xs text-slate-400 mt-1">{sub}</p>
+                        </div>
+                      ))}
+                    </div>
+
+                    <div className="bg-white p-4 rounded-xl border border-slate-200 space-y-3">
+                      <div className="flex flex-col xl:flex-row xl:items-center xl:justify-between gap-3">
+                        <div className="flex flex-wrap items-center gap-2">
+                          <button type="button" onClick={() => setResDate(addDaysIso(resDate, -1))} className="px-3 py-2 rounded-lg border border-slate-300 bg-white text-sm font-medium hover:bg-slate-50">Previous</button>
+                          <input type="date" value={resDate} onChange={(e) => setResDate(e.target.value || toIsoDate())} className="px-3 py-2 text-sm border border-slate-300 rounded-lg" />
+                          <button type="button" onClick={() => setResDate(addDaysIso(resDate, 1))} className="px-3 py-2 rounded-lg border border-slate-300 bg-white text-sm font-medium hover:bg-slate-50">Next</button>
+                          <button type="button" onClick={() => setResDate(toIsoDate())} className="px-3 py-2 rounded-lg border border-slate-300 bg-white text-sm font-medium hover:bg-slate-50">Today</button>
+                        </div>
+                        <div className="flex flex-col sm:flex-row gap-2 sm:items-center">
+                          <div className="relative">
+                            <Search className="w-4 h-4 text-slate-400 absolute left-3 top-2.5" />
+                            <input type="text" value={resSearch} onChange={(e) => setResSearch(e.target.value)} placeholder="Search name, phone, table..." className="w-full sm:w-64 pl-9 pr-3 py-2 text-sm border border-slate-300 rounded-lg" />
+                          </div>
+                          <select value={resStatusFilter} onChange={(e) => setResStatusFilter(e.target.value)} className="px-3 py-2 text-sm border border-slate-300 rounded-lg bg-white">
+                            <option value="all">All statuses</option>
+                            {RESERVATION_STATUSES.map((s) => <option key={s} value={s}>{s.replace('_', ' ')}</option>)}
+                          </select>
+                          {(resSearch || resStatusFilter !== 'all') && (
+                            <button type="button" onClick={() => { setResSearch(''); setResStatusFilter('all'); }} className="px-3 py-2 text-sm font-medium text-slate-700 border border-slate-300 rounded-lg hover:bg-slate-50 inline-flex items-center gap-1.5"><FilterX className="w-4 h-4" /> Clear</button>
+                          )}
+                        </div>
+                      </div>
+                    </div>
+
+                    {resViewMode === 'calendar' ? (
+                      <div className="bg-white rounded-xl border border-slate-200 overflow-hidden">
+                        <div className="px-4 py-3 border-b border-slate-200 flex items-center justify-between">
+                          <h2 className="font-semibold text-base">Day Schedule</h2>
+                          <span className="text-xs text-slate-500">{resDate} • {allDay.length} reservation{allDay.length === 1 ? '' : 's'}</span>
+                        </div>
+                        {allDay.length === 0 ? (
+                          <div className="p-4"><EmptyState title="No reservations for this day" message="Create a reservation or choose another date to view the schedule." actionLabel="New Reservation" onAction={() => openNewReservation(resDate)} /></div>
+                        ) : (
+                          <div className="divide-y divide-slate-100">
+                            {timeSlots.map((slot) => {
+                              const slotItems = dayReservations.filter((r) => normalizeTime24(r.time) === slot);
+                              if (slotItems.length === 0) return null;
+                              return (
+                                <div key={slot} className="p-4 grid grid-cols-[72px,1fr] gap-3">
+                                  <div className="text-sm font-semibold text-slate-700 pt-1">{formatTime12(slot)}</div>
+                                  <div className="grid grid-cols-1 md:grid-cols-2 gap-2">
+                                    {slotItems.map((r) => (
+                                      <button key={r.id} type="button" onClick={() => openEditReservation(r)} className="text-left p-3 rounded-lg border border-slate-200 bg-slate-50 hover:bg-slate-100 transition-colors">
+                                        <div className="flex items-center justify-between gap-2">
+                                          <p className="font-semibold text-sm">{r.name}</p>
+                                          <Badge tone={statusTone(r.status)}>{String(r.status).replace('_', ' ')}</Badge>
+                                        </div>
+                                        <p className="text-xs text-slate-500 mt-1">{r.guests} guests • {r.tableName || 'Unassigned'}{r.specialRequests ? ' • Special request' : ''}</p>
+                                      </button>
+                                    ))}
+                                  </div>
+                                </div>
+                              );
+                            })}
+                            {dayReservations.length === 0 && (
+                              <div className="p-4 text-sm text-slate-500">No reservations match the current filters for this day.</div>
+                            )}
+                          </div>
+                        )}
+                      </div>
+                    ) : (
+                      <div className="bg-white rounded-xl border border-slate-200 overflow-hidden">
+                        <div className="px-4 py-3 border-b border-slate-200 flex items-center justify-between">
+                          <h2 className="font-semibold text-base">Reservation List</h2>
+                          <span className="text-xs text-slate-500">{dayReservations.length} shown</span>
+                        </div>
+                        {dayReservations.length === 0 ? (
+                          <div className="p-4">
+                            <EmptyState
+                              title={allDay.length === 0 ? 'No reservations for this day' : 'No reservations match your filters'}
+                              message={allDay.length === 0 ? 'Create a new reservation to start managing bookings for this date.' : 'Try adjusting your search or status filters.'}
+                              actionLabel={allDay.length === 0 ? 'New Reservation' : 'Clear Filters'}
+                              onAction={allDay.length === 0 ? () => openNewReservation(resDate) : () => { setResSearch(''); setResStatusFilter('all'); }}
+                            />
+                          </div>
+                        ) : (
+                          <div className="divide-y divide-slate-100">
+                            {dayReservations.map((r) => (
+                              <div key={r.id} className="p-4 flex flex-col lg:flex-row lg:items-center lg:justify-between gap-3">
+                                <div className="min-w-0 space-y-1">
+                                  <div className="flex flex-wrap items-center gap-2">
+                                    <p className="font-semibold text-slate-900">{r.name}</p>
+                                    <Badge tone={statusTone(r.status)}>{String(r.status).replace('_', ' ')}</Badge>
+                                    {r.specialRequests && <span className="inline-flex items-center px-2 py-0.5 rounded-full text-[11px] font-medium bg-amber-50 text-amber-800 border border-amber-200">Special request</span>}
+                                  </div>
+                                  <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-sm text-slate-600">
+                                    <span className="inline-flex items-center gap-1.5"><Clock className="w-3.5 h-3.5" /> {formatTime12(r.time)}</span>
+                                    <span className="inline-flex items-center gap-1.5"><Users className="w-3.5 h-3.5" /> {r.guests} guests</span>
+                                    <span className="inline-flex items-center gap-1.5"><Phone className="w-3.5 h-3.5" /> {r.phone || 'No phone'}</span>
+                                    <span className="inline-flex items-center gap-1.5"><Grid className="w-3.5 h-3.5" /> {r.tableName || 'Unassigned'}</span>
+                                    {r.occasion && <span className="inline-flex items-center gap-1.5"><Calendar className="w-3.5 h-3.5" /> {r.occasion}</span>}
+                                  </div>
+                                  {r.specialRequests && <p className="text-xs text-slate-500 line-clamp-1">{r.specialRequests}</p>}
+                                </div>
+                                <div className="flex flex-wrap items-center gap-2 shrink-0">
+                                  {r.status !== 'arrived' && r.status !== 'seated' && r.status !== 'completed' && r.status !== 'cancelled' && r.status !== 'no_show' && (
+                                    <button type="button" disabled={!!actionState[`res-${r.id}`]} onClick={() => updateReservationStatus(r.id, 'arrived')} className="px-3 py-1.5 rounded-lg border border-slate-300 bg-white text-xs font-semibold hover:bg-slate-50 disabled:opacity-50">Mark Arrived</button>
+                                  )}
+                                  {(r.status === 'arrived' || r.status === 'confirmed' || r.status === 'pending') && r.status !== 'seated' && r.status !== 'completed' && r.status !== 'cancelled' && r.status !== 'no_show' && (
+                                    <button type="button" disabled={!!actionState[`res-${r.id}`]} onClick={() => updateReservationStatus(r.id, 'seated')} className="px-3 py-1.5 rounded-lg border border-slate-300 bg-white text-xs font-semibold hover:bg-slate-50 disabled:opacity-50">Mark Seated</button>
+                                  )}
+                                  <button type="button" onClick={() => openEditReservation(r)} className="px-3 py-1.5 rounded-lg border border-slate-300 bg-white text-xs font-semibold hover:bg-slate-50">Details</button>
+                                  {r.status !== 'cancelled' && r.status !== 'completed' && (
+                                    <button type="button" disabled={!!actionState[`res-${r.id}`]} onClick={() => setResConfirm({ id: r.id, name: r.name, action: 'cancelled' })} className="px-3 py-1.5 rounded-lg border border-rose-200 bg-rose-50 text-rose-700 text-xs font-semibold hover:bg-rose-100 disabled:opacity-50">Cancel</button>
+                                  )}
+                                  {actionState[`res-${r.id}`] && <Loader2 className="w-4 h-4 animate-spin text-slate-500" />}
+                                </div>
+                              </div>
+                            ))}
+                          </div>
+                        )}
+                      </div>
+                    )}
+
+                    {(resDrawerOpen || resConfirm) && (
+                      <div className="fixed inset-0 z-50">
+                        <div className="absolute inset-0 bg-slate-950/40" onClick={() => { if (!actionState.reservationSave) { setResDrawerOpen(false); setResConfirm(null); } }} />
+                        {resConfirm && (
+                          <div className="absolute inset-0 flex items-center justify-center p-4 pointer-events-none">
+                            <div className="pointer-events-auto w-full max-w-md bg-white rounded-2xl border border-slate-200 shadow-xl p-5 space-y-4">
+                              <div className="flex items-start gap-3">
+                                <AlertTriangle className="w-5 h-5 text-amber-600 mt-0.5" />
+                                <div>
+                                  <h3 className="font-semibold text-base">Cancel reservation?</h3>
+                                  <p className="text-sm text-slate-600 mt-1">This will mark the reservation for {resConfirm.name} as cancelled. You can create a new booking if needed.</p>
+                                </div>
+                              </div>
+                              <div className="flex justify-end gap-2">
+                                <button type="button" onClick={() => setResConfirm(null)} className="px-3 py-2 rounded-lg border border-slate-300 bg-white text-sm font-medium">Keep Reservation</button>
+                                <button type="button" disabled={!!actionState[`res-${resConfirm.id}`]} onClick={() => updateReservationStatus(resConfirm.id, 'cancelled')} className="px-3 py-2 rounded-lg bg-rose-600 text-white text-sm font-semibold disabled:opacity-50 inline-flex items-center gap-2">{actionState[`res-${resConfirm.id}`] && <Loader2 className="w-4 h-4 animate-spin" />}Confirm Cancel</button>
+                              </div>
+                            </div>
+                          </div>
+                        )}
+                        {resDrawerOpen && (
+                          <div className="absolute right-0 top-0 h-full w-full max-w-2xl bg-white border-l border-slate-200 shadow-2xl flex flex-col">
+                            <div className="px-5 py-4 border-b border-slate-200 flex items-center justify-between">
+                              <div>
+                                <h2 className="font-semibold text-lg">{resEditingId ? 'Reservation Details' : 'New Reservation'}</h2>
+                                <p className="text-xs text-slate-500">Assign tables with real-time availability for the selected date and time.</p>
+                              </div>
+                              <button type="button" onClick={() => setResDrawerOpen(false)} className="p-2 rounded-lg hover:bg-slate-100"><X className="w-4 h-4" /></button>
+                            </div>
+                            <div className="flex-1 overflow-y-auto p-5 space-y-5">
+                              {resFormMsg && <div className={`text-sm px-3 py-2 rounded-lg border ${resFormMsg.tone === 'danger' ? 'bg-rose-50 border-rose-200 text-rose-700' : 'bg-emerald-50 border-emerald-200 text-emerald-700'}`}>{resFormMsg.text}</div>}
+                              <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                                <div className="sm:col-span-2">
+                                  <label className="block text-xs font-medium text-slate-600 mb-1">Customer name</label>
+                                  <input type="text" value={resForm.name} onChange={(e) => setResForm({ ...resForm, name: e.target.value })} className={`w-full px-3 py-2 text-sm border rounded-lg ${resFormErrors.name ? 'border-rose-400' : 'border-slate-300'}`} placeholder="Full name" />
+                                  {resFormErrors.name && <p className="text-xs text-rose-600 mt-1">{resFormErrors.name}</p>}
+                                </div>
+                                <div>
+                                  <label className="block text-xs font-medium text-slate-600 mb-1">Phone</label>
+                                  <input type="tel" value={resForm.phone} onChange={(e) => setResForm({ ...resForm, phone: e.target.value })} className={`w-full px-3 py-2 text-sm border rounded-lg ${resFormErrors.phone ? 'border-rose-400' : 'border-slate-300'}`} placeholder="03xx xxxxxxx" />
+                                  {resFormErrors.phone && <p className="text-xs text-rose-600 mt-1">{resFormErrors.phone}</p>}
+                                </div>
+                                <div>
+                                  <label className="block text-xs font-medium text-slate-600 mb-1">Guests</label>
+                                  <input type="number" min="1" value={resForm.guests} onChange={(e) => setResForm({ ...resForm, guests: e.target.value })} className={`w-full px-3 py-2 text-sm border rounded-lg ${resFormErrors.guests ? 'border-rose-400' : 'border-slate-300'}`} />
+                                  {resFormErrors.guests && <p className="text-xs text-rose-600 mt-1">{resFormErrors.guests}</p>}
+                                </div>
+                                <div>
+                                  <label className="block text-xs font-medium text-slate-600 mb-1">Date</label>
+                                  <input type="date" value={resForm.date} onChange={(e) => setResForm({ ...resForm, date: e.target.value })} className={`w-full px-3 py-2 text-sm border rounded-lg ${resFormErrors.date ? 'border-rose-400' : 'border-slate-300'}`} />
+                                  {resFormErrors.date && <p className="text-xs text-rose-600 mt-1">{resFormErrors.date}</p>}
+                                </div>
+                                <div>
+                                  <label className="block text-xs font-medium text-slate-600 mb-1">Time</label>
+                                  <input type="time" value={resForm.time} onChange={(e) => setResForm({ ...resForm, time: e.target.value })} className={`w-full px-3 py-2 text-sm border rounded-lg ${resFormErrors.time ? 'border-rose-400' : 'border-slate-300'}`} />
+                                  {resFormErrors.time && <p className="text-xs text-rose-600 mt-1">{resFormErrors.time}</p>}
+                                </div>
+                                <div>
+                                  <label className="block text-xs font-medium text-slate-600 mb-1">Occasion (optional)</label>
+                                  <input type="text" value={resForm.occasion} onChange={(e) => setResForm({ ...resForm, occasion: e.target.value })} className="w-full px-3 py-2 text-sm border border-slate-300 rounded-lg" placeholder="Birthday, anniversary..." />
+                                </div>
+                                <div>
+                                  <label className="block text-xs font-medium text-slate-600 mb-1">Status</label>
+                                  <select value={resForm.status} onChange={(e) => setResForm({ ...resForm, status: e.target.value })} className="w-full px-3 py-2 text-sm border border-slate-300 rounded-lg bg-white">
+                                    {RESERVATION_STATUSES.map((s) => <option key={s} value={s}>{s.replace('_', ' ')}</option>)}
+                                  </select>
+                                </div>
+                              </div>
+
+                              <div className="space-y-2">
+                                <div className="flex items-center justify-between">
+                                  <label className="block text-xs font-medium text-slate-600">Table assignment</label>
+                                  <span className="text-xs text-slate-500">Availability for {resForm.date || resDate} at {formatTime12(resForm.time || '19:00')}</span>
+                                </div>
+                                <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                                  <button type="button" onClick={() => setResForm({ ...resForm, tableId: '' })} className={`text-left p-3 rounded-lg border ${!resForm.tableId ? 'border-slate-900 bg-slate-50' : 'border-slate-200 hover:bg-slate-50'}`}>
+                                    <p className="font-medium text-sm">Unassigned</p>
+                                    <p className="text-xs text-slate-500 mt-0.5">Assign later when a suitable table is free.</p>
+                                  </button>
+                                  {formTableOptions.map(({ table, capacityOk, available, conflicts }) => {
+                                    const selected = resForm.tableId === table.id;
+                                    return (
+                                      <button key={table.id} type="button" disabled={!available && !selected} onClick={() => setResForm({ ...resForm, tableId: table.id })} className={`text-left p-3 rounded-lg border ${selected ? 'border-slate-900 bg-slate-50' : available ? 'border-slate-200 hover:bg-slate-50' : 'border-slate-200 bg-slate-50 opacity-60 cursor-not-allowed'}`}>
+                                        <div className="flex items-center justify-between gap-2">
+                                          <p className="font-medium text-sm">{table.name}</p>
+                                          <Badge tone={available || selected ? 'success' : 'danger'}>{available || selected ? 'Available' : capacityOk ? 'Conflict' : 'Too small'}</Badge>
+                                        </div>
+                                        <p className="text-xs text-slate-500 mt-0.5">Seats {table.seats} • {table.waiter}</p>
+                                        {!available && !selected && conflicts.length > 0 && <p className="text-xs text-rose-600 mt-1">Booked in this time window.</p>}
+                                        {!capacityOk && <p className="text-xs text-rose-600 mt-1">Capacity below party size.</p>}
+                                      </button>
+                                    );
+                                  })}
+                                </div>
+                                {resFormErrors.tableId && <p className="text-xs text-rose-600">{resFormErrors.tableId}</p>}
+                                {selectedTableInfo && (selectedTableInfo.available || selectedTableInfo.table.id === resForm.tableId) && <p className="text-xs text-emerald-700">Selected table is available for this slot ({RESERVATION_DURATION_MIN} min window).</p>}
+                              </div>
+
+                              <div className="grid grid-cols-1 gap-4">
+                                <div>
+                                  <label className="block text-xs font-medium text-slate-600 mb-1">Special requests</label>
+                                  <textarea value={resForm.specialRequests} onChange={(e) => setResForm({ ...resForm, specialRequests: e.target.value })} rows={3} className="w-full px-3 py-2 text-sm border border-slate-300 rounded-lg" placeholder="Allergies, seating preference, accessibility..." />
+                                </div>
+                                <div>
+                                  <label className="block text-xs font-medium text-slate-600 mb-1">Internal notes</label>
+                                  <textarea value={resForm.notes} onChange={(e) => setResForm({ ...resForm, notes: e.target.value })} rows={2} className="w-full px-3 py-2 text-sm border border-slate-300 rounded-lg" placeholder="Staff-only notes" />
+                                </div>
+                              </div>
+                            </div>
+                            <div className="px-5 py-4 border-t border-slate-200 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
+                              <div className="flex flex-wrap gap-2">
+                                {resEditingId && resForm.status !== 'arrived' && resForm.status !== 'seated' && resForm.status !== 'completed' && resForm.status !== 'cancelled' && (
+                                  <button type="button" onClick={() => { setResForm((f) => ({ ...f, status: 'arrived' })); updateReservationStatus(resEditingId, 'arrived'); }} className="px-3 py-2 rounded-lg border border-slate-300 bg-white text-sm font-medium">Mark Arrived</button>
+                                )}
+                                {resEditingId && (resForm.status === 'arrived' || resForm.status === 'confirmed' || resForm.status === 'pending') && resForm.status !== 'seated' && (
+                                  <button type="button" onClick={() => { setResForm((f) => ({ ...f, status: 'seated' })); updateReservationStatus(resEditingId, 'seated'); }} className="px-3 py-2 rounded-lg border border-slate-300 bg-white text-sm font-medium">Mark Seated</button>
+                                )}
+                                {resEditingId && resForm.status !== 'cancelled' && resForm.status !== 'completed' && (
+                                  <button type="button" onClick={() => setResConfirm({ id: resEditingId, name: resForm.name || 'this guest', action: 'cancelled' })} className="px-3 py-2 rounded-lg border border-rose-200 bg-rose-50 text-rose-700 text-sm font-medium">Cancel Reservation</button>
+                                )}
+                              </div>
+                              <div className="flex gap-2 justify-end">
+                                <button type="button" onClick={() => setResDrawerOpen(false)} className="px-4 py-2 rounded-lg border border-slate-300 bg-white text-sm font-medium">Close</button>
+                                <button type="button" disabled={!!actionState.reservationSave} onClick={saveStaffReservation} className="px-4 py-2 rounded-lg bg-slate-900 text-white text-sm font-semibold inline-flex items-center gap-2 disabled:opacity-50">{actionState.reservationSave && <Loader2 className="w-4 h-4 animate-spin" />}{resEditingId ? 'Save Changes' : 'Create Reservation'}</button>
+                              </div>
+                            </div>
+                          </div>
+                        )}
+                      </div>
+                    )}
+                  </div>
+                );
+              })()}
 
               {activeTab === 'kitchen' && (
                 <div className="space-y-4">
@@ -1258,7 +1968,7 @@ function delay(ms = 500) {
                             list.map((o) => (
                               <div key={o.id} className={`p-3.5 rounded-lg border space-y-2.5 ${o.elapsedMins >= 15 && col !== 'ready' ? 'border-rose-300 bg-rose-50/40' : 'border-slate-200 bg-slate-50/50'}`}>
                                 <div className="flex items-center justify-between">
-                                  <span className="font-bold text-sm">{o.table} Ã¢â‚¬Â¢ {o.id}</span>
+                                  <span className="font-bold text-sm">{o.table} • {o.id}</span>
                                   <div className="flex items-center gap-2">
                                     {!o.synced && <span className="text-[10px] font-semibold px-1.5 py-0.5 rounded bg-amber-100 text-amber-800">Pending sync</span>}
                                     <span className="text-xs font-semibold text-slate-600">{o.elapsedMins || 0}m</span>
@@ -1301,7 +2011,7 @@ function delay(ms = 500) {
                       {readyForWaiter.map((o) => (
                         <div key={o.id} className="bg-white p-4 rounded-xl border-2 border-blue-200 space-y-3">
                           <div className="flex items-center justify-between">
-                            <div><span className="font-bold text-base">{o.table}</span><span className="text-xs text-slate-500 ml-2">{o.id} Ã¢â‚¬Â¢ {o.waiter}</span></div>
+                            <div><span className="font-bold text-base">{o.table}</span><span className="text-xs text-slate-500 ml-2">{o.id} • {o.waiter}</span></div>
                             <Badge tone="info">{o.serveStatus === 'picked_up' ? 'Delivering' : 'Ready to Serve'}</Badge>
                           </div>
                           <div className="text-sm space-y-1">{o.items.map((it, idx) => (<div key={idx}><strong>{it.qty}x</strong> {it.name}</div>))}</div>
@@ -1385,7 +2095,7 @@ function delay(ms = 500) {
                     <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                       {staff.map((m) => (
                         <div key={m.id} className="bg-white p-4 rounded-xl border border-slate-200 flex items-center justify-between gap-3">
-                          <div><p className="font-semibold text-sm">{m.name}</p><p className="text-xs text-slate-500">{m.role} Ã¢â‚¬Â¢ {m.shift}</p></div>
+                          <div><p className="font-semibold text-sm">{m.name}</p><p className="text-xs text-slate-500">{m.role} • {m.shift}</p></div>
                           <button type="button" onClick={() => { setStaff((prev) => prev.map((x) => (x.id === m.id ? { ...x, status: x.status === 'Checked In' ? 'Checked Out' : 'Checked In' } : x))); showToast(`${m.name} status updated.`); }} className="px-3 py-1.5 rounded-lg border border-slate-300 text-xs font-semibold hover:bg-slate-50">{m.status}</button>
                         </div>
                       ))}
@@ -1435,23 +2145,233 @@ function delay(ms = 500) {
               )}
 
               {activeTab === 'reports' && (
-                <div className="space-y-4">
-                  <div className="flex items-center justify-between">
-                    <h1 className="text-xl font-semibold">Reports</h1>
-                    <div className="flex gap-2">
+                <div className="space-y-5">
+                  <div className="flex flex-col lg:flex-row lg:items-center lg:justify-between gap-3">
+                    <div>
+                      <h1 className="text-xl font-semibold">Restaurant Analytics</h1>
+                      <p className="text-sm text-slate-500">Sales, products, and operations for {reportBounds.from} to {reportBounds.to}</p>
+                    </div>
+                    <div className="flex flex-wrap items-center gap-2">
+                      {[
+                        ['today', 'Today'],
+                        ['7d', '7 Days'],
+                        ['30d', '30 Days'],
+                        ['custom', 'Custom'],
+                      ].map(([id, label]) => (
+                        <button key={id} type="button" onClick={() => setReportRange(id)} className={`px-3 py-1.5 rounded-lg text-xs font-semibold border ${reportRange === id ? 'bg-slate-900 text-white border-slate-900' : 'bg-white text-slate-700 border-slate-300 hover:bg-slate-50'}`}>{label}</button>
+                      ))}
+                      {reportRange === 'custom' && (
+                        <div className="flex items-center gap-2">
+                          <input type="date" value={reportCustomFrom} onChange={(e) => setReportCustomFrom(e.target.value)} className="px-2 py-1.5 text-xs border border-slate-300 rounded-lg bg-white" />
+                          <span className="text-xs text-slate-400">to</span>
+                          <input type="date" value={reportCustomTo} onChange={(e) => setReportCustomTo(e.target.value)} className="px-2 py-1.5 text-xs border border-slate-300 rounded-lg bg-white" />
+                        </div>
+                      )}
                       <button type="button" disabled={!!actionState.exportCsv} onClick={exportCsv} className="px-3 py-1.5 rounded-lg border border-slate-300 bg-white text-xs font-semibold inline-flex items-center gap-1.5 disabled:opacity-50">{actionState.exportCsv ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Download className="w-3.5 h-3.5" />} CSV</button>
                       <button type="button" onClick={() => window.print()} className="px-3 py-1.5 rounded-lg bg-slate-900 text-white text-xs font-semibold inline-flex items-center gap-1.5"><Printer className="w-3.5 h-3.5" /> Print</button>
                     </div>
                   </div>
-                  <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
-                    <div className="bg-white p-4 rounded-xl border border-slate-200"><p className="text-xs text-slate-500">Gross Revenue</p><p className="text-2xl font-bold mt-1">PKR {grossSales.toLocaleString()}</p></div>
-                    <div className="bg-white p-4 rounded-xl border border-slate-200"><p className="text-xs text-slate-500">Orders Count</p><p className="text-2xl font-bold mt-1">{orders.length}</p></div>
-                    <div className="bg-white p-4 rounded-xl border border-slate-200"><p className="text-xs text-slate-500">Average Ticket</p><p className="text-2xl font-bold mt-1">PKR {orders.length ? Math.round(grossSales / orders.length).toLocaleString() : 0}</p></div>
+
+                  <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-5 gap-4">
+                    {[
+                      { label: 'Gross Revenue', value: `PKR ${reportMetrics.revenue.toLocaleString()}`, cmp: reportMetrics.cmp.revenue, sub: `vs PKR ${reportMetrics.prev.revenue.toLocaleString()}` },
+                      { label: 'Orders', value: String(reportMetrics.count), cmp: reportMetrics.cmp.count, sub: `vs ${reportMetrics.prev.count}` },
+                      { label: 'Average Ticket', value: `PKR ${reportMetrics.avg.toLocaleString()}`, cmp: reportMetrics.cmp.avg, sub: `vs PKR ${reportMetrics.prev.avg.toLocaleString()}` },
+                      { label: 'Collected', value: `PKR ${reportMetrics.collected.toLocaleString()}`, cmp: reportMetrics.cmp.collected, sub: 'Paid orders', tone: 'text-emerald-700' },
+                      { label: 'Unpaid', value: `PKR ${reportMetrics.unpaid.toLocaleString()}`, cmp: reportMetrics.cmp.unpaid, sub: 'Outstanding', tone: 'text-rose-700', invert: true },
+                    ].map((k) => {
+                      const positive = k.invert ? k.cmp <= 0 : k.cmp >= 0;
+                      return (
+                        <div key={k.label} className="bg-white p-4 rounded-xl border border-slate-200">
+                          <p className="text-xs text-slate-500">{k.label}</p>
+                          <p className={`text-xl font-bold mt-1 ${k.tone || 'text-slate-900'}`}>{k.value}</p>
+                          <div className="mt-2 flex items-center justify-between gap-2">
+                            <span className={`text-xs font-medium ${positive ? 'text-emerald-700' : 'text-rose-700'}`}>{k.cmp > 0 ? '+' : ''}{k.cmp}%</span>
+                            <span className="text-xs text-slate-400">{k.sub}</span>
+                          </div>
+                        </div>
+                      );
+                    })}
                   </div>
-                  <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
-                    <div className="bg-white p-4 rounded-xl border border-slate-200"><p className="text-xs text-slate-500">Collected</p><p className="text-xl font-bold mt-1 text-emerald-700">PKR {collectedSales.toLocaleString()}</p></div>
-                    <div className="bg-white p-4 rounded-xl border border-slate-200"><p className="text-xs text-slate-500">Unpaid</p><p className="text-xl font-bold mt-1 text-rose-700">PKR {unpaidTotal.toLocaleString()}</p></div>
-                    <div className="bg-white p-4 rounded-xl border border-slate-200"><p className="text-xs text-slate-500">Pending Sync</p><p className="text-xl font-bold mt-1 text-amber-700">{pendingSync}</p></div>
+
+                  <div className="grid grid-cols-1 xl:grid-cols-3 gap-4">
+                    <div className="xl:col-span-2 bg-white p-4 sm:p-5 rounded-xl border border-slate-200">
+                      <div className="flex items-center justify-between mb-4">
+                        <h2 className="font-semibold text-base">Sales Overview</h2>
+                        <p className="text-xs text-slate-500">Daily revenue in selected range</p>
+                      </div>
+                      {salesByDay.every((d) => d.revenue === 0) ? (
+                        <EmptyState title="No sales in this period" message="Try a different date range to see revenue trends." />
+                      ) : (
+                        <div className="h-52 flex items-end gap-2">
+                          {salesByDay.map((d) => {
+                            const max = Math.max(1, ...salesByDay.map((x) => x.revenue));
+                            const h = Math.round((d.revenue / max) * 100);
+                            return (
+                              <div key={d.date} className="flex-1 min-w-0 flex flex-col items-center gap-1">
+                                <div className="w-full bg-slate-100 rounded-md h-40 flex items-end overflow-hidden" title={`${d.label}: PKR ${d.revenue.toLocaleString()} (${d.orders} orders)`}>
+                                  <div className="w-full bg-slate-900 rounded-md" style={{ height: `${Math.max(d.revenue > 0 ? 8 : 0, h)}%` }} />
+                                </div>
+                                <span className="text-[10px] text-slate-500 truncate w-full text-center">{d.label}</span>
+                              </div>
+                            );
+                          })}
+                        </div>
+                      )}
+                    </div>
+
+                    <div className="bg-white p-4 sm:p-5 rounded-xl border border-slate-200">
+                      <h2 className="font-semibold text-base mb-4">Order Source</h2>
+                      {sourceBreakdown.every((s) => s.value === 0) ? (
+                        <EmptyState title="No source data" message="Orders in this range will appear here by channel." />
+                      ) : (
+                        <div className="space-y-3">
+                          {sourceBreakdown.map((s) => {
+                            const total = Math.max(1, sourceBreakdown.reduce((a, b) => a + b.value, 0));
+                            const pct = Math.round((s.value / total) * 100);
+                            const colors = { 'Dine-In': 'bg-slate-900', 'Takeaway': 'bg-amber-500', 'Delivery': 'bg-blue-600' };
+                            return (
+                              <div key={s.name}>
+                                <div className="flex items-center justify-between text-sm mb-1"><span className="font-medium text-slate-700">{s.name}</span><span className="text-slate-500">PKR {s.value.toLocaleString()} ({pct}%)</span></div>
+                                <div className="h-2.5 bg-slate-100 rounded-full overflow-hidden"><div className={`h-full rounded-full ${colors[s.name] || 'bg-slate-500'}`} style={{ width: `${pct}%` }} /></div>
+                              </div>
+                            );
+                          })}
+                        </div>
+                      )}
+                    </div>
+                  </div>
+
+                  <div className="grid grid-cols-1 xl:grid-cols-3 gap-4">
+                    <div className="bg-white p-4 sm:p-5 rounded-xl border border-slate-200">
+                      <h2 className="font-semibold text-base mb-4">Category-wise Sales</h2>
+                      {categoryBreakdown.length === 0 ? (
+                        <EmptyState title="No category sales" message="Item sales for this range will be grouped by category here." />
+                      ) : (
+                        <div className="space-y-3">
+                          {categoryBreakdown.map((c) => {
+                            const max = Math.max(1, ...categoryBreakdown.map((x) => x.value));
+                            const pct = Math.round((c.value / max) * 100);
+                            return (
+                              <div key={c.name}>
+                                <div className="flex items-center justify-between text-sm mb-1"><span className="font-medium text-slate-700">{c.name}</span><span className="text-slate-500">PKR {c.value.toLocaleString()}</span></div>
+                                <div className="h-2 bg-slate-100 rounded-full overflow-hidden"><div className="h-full rounded-full bg-slate-800" style={{ width: `${pct}%` }} /></div>
+                              </div>
+                            );
+                          })}
+                        </div>
+                      )}
+                    </div>
+
+                    <div className="bg-white p-4 sm:p-5 rounded-xl border border-slate-200">
+                      <h2 className="font-semibold text-base mb-4">Payment Methods</h2>
+                      {paymentBreakdown.length === 0 ? (
+                        <EmptyState title="No payments recorded" message="Payment method totals for this range will appear here." />
+                      ) : (
+                        <div className="space-y-3">
+                          {paymentBreakdown.map((p) => {
+                            const total = Math.max(1, paymentBreakdown.reduce((a, b) => a + b.value, 0));
+                            const pct = Math.round((p.value / total) * 100);
+                            const colors = { Cash: 'bg-emerald-600', Card: 'bg-blue-600', Online: 'bg-violet-600', Pending: 'bg-amber-500' };
+                            return (
+                              <div key={p.name} className="flex items-center justify-between gap-3">
+                                <div className="flex items-center gap-2 min-w-0">
+                                  <span className={`w-2.5 h-2.5 rounded-full ${colors[p.name] || 'bg-slate-500'}`} />
+                                  <span className="text-sm font-medium text-slate-700 truncate">{p.name}</span>
+                                </div>
+                                <div className="text-right shrink-0">
+                                  <p className="text-sm font-semibold">PKR {p.value.toLocaleString()}</p>
+                                  <p className="text-xs text-slate-500">{pct}%</p>
+                                </div>
+                              </div>
+                            );
+                          })}
+                        </div>
+                      )}
+                    </div>
+
+                    <div className="bg-white p-4 sm:p-5 rounded-xl border border-slate-200">
+                      <h2 className="font-semibold text-base mb-4">Top-Selling Products</h2>
+                      {topProducts.length === 0 ? (
+                        <EmptyState title="No product sales" message="Best-selling items for this range will appear here." />
+                      ) : (
+                        <div className="space-y-3">
+                          {topProducts.map((p, idx) => (
+                            <div key={p.name} className="flex items-center justify-between gap-3">
+                              <div className="min-w-0">
+                                <p className="text-sm font-medium text-slate-800 truncate">{idx + 1}. {p.name}</p>
+                                <p className="text-xs text-slate-500">{p.qty} sold</p>
+                              </div>
+                              <span className="text-sm font-semibold text-slate-900 shrink-0">PKR {p.revenue.toLocaleString()}</span>
+                            </div>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+                  </div>
+
+                  <div className="grid grid-cols-1 xl:grid-cols-3 gap-4">
+                    <div className="xl:col-span-1 bg-white p-4 sm:p-5 rounded-xl border border-slate-200">
+                      <h2 className="font-semibold text-base mb-4">Peak Sales Hours</h2>
+                      {peakHours.every((h) => h.orders === 0) ? (
+                        <EmptyState title="No hourly activity" message="Order volume by hour will appear here for the selected range." />
+                      ) : (
+                        <div className="h-44 flex items-end gap-1.5">
+                          {peakHours.map((h) => {
+                            const max = Math.max(1, ...peakHours.map((x) => x.orders));
+                            const ht = Math.round((h.orders / max) * 100);
+                            return (
+                              <div key={h.hour} className="flex-1 flex flex-col items-center gap-1" title={`${h.label}: ${h.orders} orders, PKR ${h.revenue.toLocaleString()}`}>
+                                <div className="w-full bg-slate-100 rounded h-32 flex items-end overflow-hidden">
+                                  <div className="w-full bg-amber-500 rounded" style={{ height: `${Math.max(h.orders > 0 ? 10 : 0, ht)}%` }} />
+                                </div>
+                                <span className="text-[10px] text-slate-500">{h.label}</span>
+                              </div>
+                            );
+                          })}
+                        </div>
+                      )}
+                    </div>
+
+                    <div className="xl:col-span-2 bg-white rounded-xl border border-slate-200 overflow-hidden">
+                      <div className="px-4 sm:px-5 py-4 border-b border-slate-200 flex items-center justify-between">
+                        <h2 className="font-semibold text-base">Recent Orders</h2>
+                        <span className="text-xs text-slate-500">{reportOrders.length} order{reportOrders.length === 1 ? '' : 's'} in range</span>
+                      </div>
+                      {reportRecentOrders.length === 0 ? (
+                        <div className="p-4"><EmptyState title="No orders in this period" message="Adjust the date range to view recent orders." /></div>
+                      ) : (
+                        <div className="overflow-x-auto">
+                          <table className="min-w-full text-sm">
+                            <thead className="bg-slate-50 text-slate-600">
+                              <tr>
+                                <th className="text-left px-4 py-3 font-medium">Date</th>
+                                <th className="text-left px-4 py-3 font-medium">Order</th>
+                                <th className="text-left px-4 py-3 font-medium">Source</th>
+                                <th className="text-left px-4 py-3 font-medium">Payment</th>
+                                <th className="text-left px-4 py-3 font-medium">Status</th>
+                                <th className="text-right px-4 py-3 font-medium">Total</th>
+                              </tr>
+                            </thead>
+                            <tbody>
+                              {reportRecentOrders.map((o) => {
+                                const d = orderDate(o);
+                                return (
+                                  <tr key={o.id} className="border-t border-slate-100">
+                                    <td className="px-4 py-3 text-slate-600 whitespace-nowrap">{toIsoDate(d)} {d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</td>
+                                    <td className="px-4 py-3 font-medium">{o.id}<div className="text-xs text-slate-500 font-normal">{o.table}</div></td>
+                                    <td className="px-4 py-3">{o.source}</td>
+                                    <td className="px-4 py-3">{o.paymentMethod || '—'} {o.paid ? <span className="text-emerald-700">(Paid)</span> : <span className="text-amber-700">(Unpaid)</span>}</td>
+                                    <td className="px-4 py-3"><Badge tone={o.refunded ? 'danger' : o.serveStatus === 'served' ? 'success' : 'warning'}>{o.refunded ? 'Refunded' : o.serveStatus === 'served' ? 'Served' : o.kitchenStatus}</Badge></td>
+                                    <td className="px-4 py-3 text-right font-semibold">PKR {Number(o.total || 0).toLocaleString()}</td>
+                                  </tr>
+                                );
+                              })}
+                            </tbody>
+                          </table>
+                        </div>
+                      )}
+                    </div>
                   </div>
                 </div>
               )}              {activeTab === 'website' && (
@@ -1635,11 +2555,15 @@ function delay(ms = 500) {
                     <div className="grid grid-cols-1 lg:grid-cols-2 gap-5">
                       <div className="bg-white p-5 rounded-xl border border-slate-200 space-y-4">
                         <h2 className="font-semibold text-base">Reserve a Table</h2>
+                        {webResMsg && (
+                          <div className={`text-sm px-3 py-2 rounded-lg border ${webResMsg.tone === 'danger' ? 'bg-rose-50 border-rose-200 text-rose-700' : 'bg-emerald-50 border-emerald-200 text-emerald-700'}`}>{webResMsg.text}</div>
+                        )}
                         <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-                          <input type="text" value={resForm.name} onChange={(e) => setResForm({ ...resForm, name: e.target.value })} placeholder="Full name" className="px-3 py-2 text-sm border border-slate-300 rounded-lg sm:col-span-2" />
-                          <input type="date" value={resForm.date} onChange={(e) => setResForm({ ...resForm, date: e.target.value })} className="px-3 py-2 text-sm border border-slate-300 rounded-lg" />
-                          <input type="time" value={resForm.time} onChange={(e) => setResForm({ ...resForm, time: e.target.value })} className="px-3 py-2 text-sm border border-slate-300 rounded-lg" />
-                          <input type="number" min="1" value={resForm.guests} onChange={(e) => setResForm({ ...resForm, guests: e.target.value })} placeholder="Guests" className="px-3 py-2 text-sm border border-slate-300 rounded-lg sm:col-span-2" />
+                          <input type="text" value={webResForm.name} onChange={(e) => setWebResForm({ ...webResForm, name: e.target.value })} placeholder="Full name" className="px-3 py-2 text-sm border border-slate-300 rounded-lg sm:col-span-2" />
+                          <input type="tel" value={webResForm.phone} onChange={(e) => setWebResForm({ ...webResForm, phone: e.target.value })} placeholder="Phone number" className="px-3 py-2 text-sm border border-slate-300 rounded-lg sm:col-span-2" />
+                          <input type="date" value={webResForm.date} onChange={(e) => setWebResForm({ ...webResForm, date: e.target.value })} className="px-3 py-2 text-sm border border-slate-300 rounded-lg" />
+                          <input type="time" value={webResForm.time} onChange={(e) => setWebResForm({ ...webResForm, time: e.target.value })} className="px-3 py-2 text-sm border border-slate-300 rounded-lg" />
+                          <input type="number" min="1" value={webResForm.guests} onChange={(e) => setWebResForm({ ...webResForm, guests: e.target.value })} placeholder="Guests" className="px-3 py-2 text-sm border border-slate-300 rounded-lg sm:col-span-2" />
                         </div>
                         <button type="button" disabled={!!actionState.reservation} onClick={placeReservation} className="w-full py-2.5 rounded-lg bg-slate-900 text-white text-sm font-semibold disabled:opacity-50 inline-flex items-center justify-center gap-2">
                           {actionState.reservation ? <Loader2 className="w-4 h-4 animate-spin" /> : <CheckCircle className="w-4 h-4" />}
@@ -1657,9 +2581,9 @@ function delay(ms = 500) {
                               <div key={r.id} className="p-3 rounded-lg border border-slate-200 bg-slate-50 flex items-center justify-between gap-3 text-sm">
                                 <div>
                                   <p className="font-semibold">{r.name} <span className="text-slate-500 font-normal">({r.guests} guests)</span></p>
-                                  <p className="text-xs text-slate-500">{r.date} at {r.time}</p>
+                                  <p className="text-xs text-slate-500">{r.date} at {formatTime12(r.time)}</p>
                                 </div>
-                                <Badge tone={r.status === 'pending' ? 'warning' : 'success'}>{r.status}</Badge>
+                                <Badge tone={r.status === 'pending' ? 'warning' : r.status === 'cancelled' || r.status === 'no_show' ? 'danger' : 'success'}>{String(r.status || 'pending').replace('_', ' ')}</Badge>
                               </div>
                             ))}
                           </div>
@@ -1680,7 +2604,7 @@ function delay(ms = 500) {
                     <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
                       <div className="bg-white p-5 rounded-xl border border-slate-200"><p className="text-xs text-slate-500">Phone</p><p className="font-semibold mt-1">+92 300 1234567</p></div>
                       <div className="bg-white p-5 rounded-xl border border-slate-200"><p className="text-xs text-slate-500">Email</p><p className="font-semibold mt-1">hello@restroflow.demo</p></div>
-                      <div className="bg-white p-5 rounded-xl border border-slate-200"><p className="text-xs text-slate-500">Hours</p><p className="font-semibold mt-1">12:00 PM ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã…â€œ 11:30 PM</p></div>
+                      <div className="bg-white p-5 rounded-xl border border-slate-200"><p className="text-xs text-slate-500">Hours</p><p className="font-semibold mt-1">12:00 PM – 11:30 PM</p></div>
                     </div>
                   )}
 
